@@ -5,6 +5,7 @@ import logging
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from config import Config
+
 logger = logging.getLogger(__name__)
 
 def create_db_engine(config=None):

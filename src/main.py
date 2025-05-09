@@ -6,6 +6,7 @@ import argparse
 import time
 import traceback
 from datetime import datetime
+
 from config import Config
 from db.engine import create_db_engine, init_db
 from db.models import Base
@@ -19,10 +20,49 @@ from transformation.calculations import (
 )
 from transformation.quality import run_data_quality_checks, apply_data_fixes
 from loading.writer import load_transformed_data, export_results_to_csv
+import os
+from dotenv import load_dotenv
+import psycopg2
+
+
+load_dotenv()
+
+# Database connection parameters 
+DB_PARAMS = {
+    'host': os.getenv('POSTGRES_HOST'),
+    'database': os.getenv('POSTGRES_DB'),
+    'user': os.getenv('POSTGRES_USER'),
+    'password':os.getenv('POSTGRES_PASSWORD') ,
+    'port': os.getenv('POSTGRES_PORT') 
+}
+
+def create_engine():
+    """Create postgres engine from DB parameters"""
+    return f"postgresql://{DB_PARAMS['user']}:{DB_PARAMS['password']}@{DB_PARAMS['host']}:{DB_PARAMS['port']}/{DB_PARAMS['database']}"
+
+def connect_to_db():
+    """Establish connection to PostgreSQL database"""
+    try:
+        conn = psycopg2.connect(
+            host=DB_PARAMS['host'],
+            database=DB_PARAMS['database'],
+            user=DB_PARAMS['user'],
+            password=DB_PARAMS['password'],
+            port=DB_PARAMS['port']
+        )
+        logger.info("Successfully connected to PostgreSQL database")
+        return conn
+    except Exception as e:
+        logger.error(f"Error connecting to PostgreSQL database: {e}")
+        raise
+
 
 logger = logging.getLogger(__name__)
 
 def run_pipeline(config_file='config.ini', incremental=None, quality_check=None, export_csv=False):
+    """
+    Run the complete data pipeline.
+    """
     start_time = time.time()
     statistics = {
         'start_time': datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
@@ -30,6 +70,7 @@ def run_pipeline(config_file='config.ini', incremental=None, quality_check=None,
         'stages': {},
     }
     
+    conn = None  # Initialize connection variable
     try:
         logger.info("Starting data pipeline")
         
@@ -49,22 +90,19 @@ def run_pipeline(config_file='config.ini', incremental=None, quality_check=None,
         
         logger.info(f"Pipeline mode: incremental={run_incremental}, quality_check={run_quality_check}")
         
-        # Create database engine
-        engine = create_db_engine(config)
+        # Create database connection
+        conn = connect_to_db()
         
-        # Initialize database tables
-        init_db(engine, Base)
-        
-        #  Data Ingestion
+        # Data Ingestion
         stage_start = time.time()
         
         if run_incremental:
             # Get last processed date
-            last_date = get_last_processed_date(engine)
+            last_date = get_last_processed_date(conn)
             
             if last_date is None:
                 logger.info("No previous data found, running full pipeline")
-                staged_data = load_staging_data(config, engine)
+                staged_data = load_staging_data(config, conn)
                 statistics['stages']['ingestion'] = {
                     'mode': 'full',
                     'rows_processed': {
@@ -73,7 +111,7 @@ def run_pipeline(config_file='config.ini', incremental=None, quality_check=None,
                 }
             else:
                 logger.info(f"Incremental mode: processing data after {last_date}")
-                staged_data = load_incremental_data(config, engine, last_date)
+                staged_data = load_incremental_data(config, conn, last_date)
                 
                 if staged_data is None:
                     logger.info("No new data to process")
@@ -91,7 +129,7 @@ def run_pipeline(config_file='config.ini', incremental=None, quality_check=None,
                 }
         else:
             # Full load
-            staged_data = load_staging_data(config, engine)
+            staged_data = load_staging_data(config, conn)
             statistics['stages']['ingestion'] = {
                 'mode': 'full',
                 'rows_processed': {
@@ -169,7 +207,7 @@ def run_pipeline(config_file='config.ini', incremental=None, quality_check=None,
         stage_start = time.time()
         
         # Load transformed data
-        success = load_transformed_data(engine, transformed_data, run_incremental)
+        success = load_transformed_data(conn, transformed_data, run_incremental)
         
         statistics['stages']['loading'] = {
             'duration': time.time() - stage_start,
@@ -197,9 +235,13 @@ def run_pipeline(config_file='config.ini', incremental=None, quality_check=None,
         statistics['status'] = 'failed'
         statistics['error'] = str(e)
     
-    # Calculate total duration
-    statistics['duration'] = time.time() - start_time
+    finally:
+        # Ensure the connection is closed in the finally block
+        if conn:
+            conn.close()
     
+    # Calculate total duration (outside the try-except-finally blocks)
+    statistics['duration'] = time.time() - start_time
     return statistics
 
 def main():

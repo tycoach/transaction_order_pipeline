@@ -166,8 +166,12 @@ def verify_totals(orders_df, order_items_df):
     try:
         logger.info("Verifying order total amounts")
         
-        # Check and print available columns in orders_df for debugging
+        # Check available columns in orders_df
         logger.info(f"Available columns in orders_df: {orders_df.columns.tolist()}")
+        
+        # Clean column names by stripping whitespace (important for 'total_amount ')
+        orders_df = orders_df.rename(columns=lambda x: x.strip())
+        logger.info(f"Cleaned column names: {orders_df.columns.tolist()}")
         
         # Find the correct column name for total_amount
         total_amount_column = None
