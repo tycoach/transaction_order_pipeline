@@ -1,0 +1,226 @@
+name: Transaction Data Pipeline
+
+on:
+  schedule:
+    # Run daily at 11 AM UTC
+    - cron: '0 11 * * *'
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'src/**'
+      - 'config.ini'
+      - '.github/workflows/data_pipeline.yml'
+  pull_request:
+    branches: [ main, master ]
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'Pipeline Mode'
+        required: true
+        default: 'full'
+        type: choice
+        options:
+          - full
+          - incremental
+      quality_check:
+        description: 'Run Data Quality Checks'
+        required: true
+        default: 'true'
+        type: boolean
+
+env:
+  PIPELINE_DIR: ${{ github.workspace }}
+  DATA_DIR: ${{ github.workspace }}/data
+  POSTGRES_DB: ${{ env.POSTGRES_DB }}
+  POSTGRES_USER: ${{ env.POSTGRES_USER }}
+  POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+  POSTGRES_DB: restaurant_data
+  POSTGRES_HOST: ${{ env.POSTGRES_HOST }}
+  POSTGRES_PORT: ${{ env.POSTGRES_PORT }}
+
+jobs:
+  lint-and-test:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-cov flake8 black isort
+      
+      - name: Lint with flake8
+        run: |
+          flake8 src/ tests/ --count --select=E9,F63,F7,F82 --show-source --statistics
+      
+      - name: Check code formatting with black
+        run: |
+          black --check src/ tests/
+      
+      - name: Check import order with isort
+        run: |
+          isort --check-only --profile black src/ tests/
+      
+      - name: Run unit tests
+        run: |
+          pytest -v tests/
+  
+  run-pipeline:
+    name: Run Data Pipeline
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    
+    services:
+      postgres:
+        image: postgres:14
+        env:
+          POSTGRES_DB: ${{ env.POSTGRES_DB }}
+          POSTGRES_USER: ${{ env.POSTGRES_USER }}
+          POSTGRES_PASSWORD: ${{ env.POSTGRES_PASSWORD }}
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+      
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install psycopg2-binary pandas-gbq
+      
+      - name: Create directories
+        run: |
+          mkdir -p ${{ env.DATA_DIR }}/input
+          mkdir -p ${{ env.DATA_DIR }}/output
+          mkdir -p ${{ env.DATA_DIR }}/archive
+          mkdir -p ${{ env.DATA_DIR }}/logs
+      
+      - name: Set up config file
+        run: |
+          cat << EOF > config.ini
+          [DATABASE]
+          type = postgresql
+          name = ${{ env.POSTGRES_DB }}
+          host = ${{ env.POSTGRES_HOST }}
+          port = ${{ env.POSTGRES_PORT }}
+          user = ${{ env.POSTGRES_USER }}
+          password = ${{ env.POSTGRES_PASSWORD }}
+          
+          [LOGGING]
+          level = INFO
+          file = ${{ env.DATA_DIR }}/logs/pipeline.log
+          
+          [PATHS]
+          input_dir = ${{ env.DATA_DIR }}/input
+          output_dir = ${{ env.DATA_DIR }}/output
+          
+          [PIPELINE]
+          incremental = ${{ github.event.inputs.mode == 'incremental' || 'false' }}
+          quality_check = ${{ github.event.inputs.quality_check || 'true' }}
+          EOF
+      
+      - name: Initialize database
+        run: |
+          psql -h ${{ env.POSTGRES_HOST }} -p ${{ env.POSTGRES_PORT }} -U ${{ env.POSTGRES_USER }} -d ${{ env.POSTGRES_DB }} -f database_scripts.sql
+        env:
+          PGPASSWORD: ${{ env.POSTGRES_PASSWORD }}
+      
+      - name: Download source data
+        uses: actions/download-artifact@v3
+        with:
+          name: source-data
+          path: ${{ env.DATA_DIR }}/input
+        continue-on-error: true
+      
+      - name: Check for data files or use sample data
+        run: |
+          if [ ! -f "${{ env.DATA_DIR }}/input/orders.csv" ] || [ ! -f "${{ env.DATA_DIR }}/input/order_item.csv" ] || [ ! -f "${{ env.DATA_DIR }}/input/menu_items.csv" ]; then
+            echo "Using sample data files"
+            # Copy sample data
+            cp -f data/sample/orders.csv ${{ env.DATA_DIR }}/input/
+            cp -f data/sample/order_item.csv ${{ env.DATA_DIR }}/input/
+            cp -f data/sample/menu_items.csv ${{ env.DATA_DIR }}/input/
+          else
+            echo "Using existing data files"
+          fi
+      
+      - name: Run pipeline
+        run: |
+          python -m src.pipeline --config config.ini ${{ github.event.inputs.mode == 'incremental' && '--incremental' || '--full' }} ${{ github.event.inputs.quality_check == 'true' && '--quality-check' || '--no-quality-check' }} --export-csv
+      
+      - name: Archive logs
+        uses: actions/upload-artifact@v3
+        with:
+          name: pipeline-logs
+          path: ${{ env.DATA_DIR }}/logs/
+      
+      - name: Archive output files
+        uses: actions/upload-artifact@v3
+        with:
+          name: pipeline-output
+          path: ${{ env.DATA_DIR }}/output/
+      
+      - name: Run analysis queries
+        run: |
+          psql -h ${{ env.POSTGRES_HOST }} -p ${{ env.POSTGRES_PORT }} -U ${{ env.POSTGRES_USER }} -d ${{ env.POSTGRES_DB }} -f analysis_queries.sql > ${{ env.DATA_DIR }}/output/analysis_results.txt
+        env:
+          PGPASSWORD: ${{ env.POSTGRES_PASSWORD }}
+      
+      - name: Generate report
+        run: |
+          python -m src.utils.report_generator --output ${{ env.DATA_DIR }}/output/pipeline_report.html
+      
+      - name: Upload report
+        uses: actions/upload-artifact@v3
+        with:
+          name: pipeline-report
+          path: ${{ env.DATA_DIR }}/output/pipeline_report.html
+  
+      
+      - name: Send notification
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.MAIL_SERVER }}
+          server_port: ${{ secrets.MAIL_PORT }}
+          username: ${{ secrets.MAIL_USERNAME }}
+          password: ${{ secrets.MAIL_PASSWORD }}
+          subject: "Restaurant Data Pipeline - ${{ job.status }}"
+          body: |
+            Restaurant Data Pipeline run completed with status: ${{ job.status }}
+            
+            Run details:
+            - Workflow: ${{ github.workflow }}
+            - Run ID: ${{ github.run_id }}
+            - Run Number: ${{ github.run_number }}
+            - Commit: ${{ github.sha }}
+            
+            See the attached report for details.
+          to: data-team@example.com
+          from: GitHub Actions <actions@github.com>
+          attachments: ${{ env.DATA_DIR }}/output/pipeline_report.html
+        # Send email only if MAIL_* secrets are configured
+        continue-on-error: true
